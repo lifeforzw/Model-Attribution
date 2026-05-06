@@ -1,0 +1,25 @@
+{
+  "model": {
+    "provider": "transformers",
+    "name_or_path": "gpt2",
+    "kwargs": {
+      "torch_dtype": "auto"
+    }
+  },
+  "hooks": [
+    {
+      "name": "scale_attention_output",
+      "type": "forward",
+      "matcher": {
+        "kind": "name",
+        "pattern": "(attn|attention)"
+      },
+      "transform": {
+        "kind": "scale",
+        "params": {
+          "factor": 0.5
+        }
+      }
+    }
+  ]
+}
