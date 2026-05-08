@@ -199,3 +199,44 @@ result = AttributionPatchingRunner(
 ```
 
 `ActivationLocation.tensor_path` 可用于从模块输出的 tuple/list/dict 中取出具体 tensor；`attribution_slice` 用于只返回指定 token 位置、batch 位置或 hidden 维度。
+
+## 实验脚本
+
+仓库提供了三类 shell 脚本，默认用 `gpt2` 和最后一个 token 位置做示例：
+
+```bash
+bash scripts/run_integrated_gradients.sh
+bash scripts/run_attribution_patching.sh
+bash scripts/run_attribution_sweep.sh
+```
+
+常用参数可以用环境变量覆盖：
+
+```bash
+MODEL=gpt2 \
+PROMPT="The capital of France is" \
+TARGET_TEXT=" Paris" \
+HOOK_PATTERN='.*mlp.*' \
+STEPS=32 \
+OUTPUT_DIR=runs/ig_demo \
+bash scripts/run_integrated_gradients.sh
+```
+
+AtP：
+
+```bash
+MODEL=gpt2 \
+CLEAN_PROMPT="The capital of France is" \
+CORRUPT_PROMPT="The capital of Italy is" \
+TARGET_TEXT=" Paris" \
+HOOK_PATTERN='.*attn.*' \
+OUTPUT_DIR=runs/atp_demo \
+bash scripts/run_attribution_patching.sh
+```
+
+脚本会保存两个文件：
+
+- `*.pt`：完整 `AttributionResult`，包含 attribution values、activations、gradients。
+- `*.summary.json`：每个命中模块的 shape、sum、mean_abs、L2 norm。
+
+AtP 的 clean/corrupt 输入应尽量保持 token 长度一致；如果长度不同，目标模块激活的逐元素差值可能无法计算。
