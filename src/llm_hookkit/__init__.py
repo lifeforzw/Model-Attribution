@@ -21,6 +21,18 @@ from .transforms import (
     TransformRegistry,
     make_activation_callback,
 )
+from .temporary_ffn import (
+    MemoryCost,
+    TemporaryFFNFitResult,
+    TemporarySoftmaxFFN,
+    TrainTemporaryFFNConfig,
+    build_exact_attention_ffn,
+    fit_temporary_ffn,
+    generate_random_qkv,
+    reconstruction_metrics,
+    run_compression_sweep,
+    scaled_dot_product_attention,
+)
 
 __all__ = [
     "ActivationTransform",
@@ -46,5 +58,15 @@ __all__ = [
     "capture_activations",
     "capture_activations_and_gradients",
     "make_activation_callback",
+    "MemoryCost",
     "run_with_patched_activations",
+    "TemporaryFFNFitResult",
+    "TemporarySoftmaxFFN",
+    "TrainTemporaryFFNConfig",
+    "build_exact_attention_ffn",
+    "fit_temporary_ffn",
+    "generate_random_qkv",
+    "reconstruction_metrics",
+    "run_compression_sweep",
+    "scaled_dot_product_attention",
 ]
