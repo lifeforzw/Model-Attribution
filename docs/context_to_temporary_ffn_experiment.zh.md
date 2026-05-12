@@ -702,3 +702,285 @@ $$
 $$
 
 且在 $M\ll N$ 时仍能保持较低误差，则说明“将长上下文信息从 sequence-level KV cache 转移到 parameter-level temporary memory”具有进一步研究价值。
+
+## 13. 本次工程化准备与待执行实验流程
+
+本节记录本仓库后续将要执行的实验操作。由于当前服务器计算资源暂时不足，本次只完成环境、数据、命令矩阵和脚本文档准备，不启动正式训练或真实模型激活拟合。
+
+### 13.1 当前代码入口
+
+核心实验入口为：
+
+```bash
+examples/run_temp_ffn_compression.py
+```
+
+该入口包含三个子命令：
+
+| 子命令 | 用途 |
+| --- | --- |
+| `random` | 构造随机 $Q,K,V$ 并训练 temporary FFN 拟合完整 attention 输出 |
+| `hf-activations` | 从 HuggingFace causal LM 的 packed QKV projection 中捕获真实 $Q,K,V$，再进行 temporary FFN 拟合 |
+| `memory` | 生成 KV cache 与 temporary FFN 参数量对比表 |
+
+新增的准备脚本：
+
+| 文件 | 作用 |
+| --- | --- |
+| `scripts/setup_temp_ffn_env.sh` | 创建 `.venv`，按 CPU/CUDA 配置安装 PyTorch、项目依赖、`datasets` 和 `accelerate` |
+| `scripts/prepare_temp_ffn_dataset.py` | 从 synthetic、WikiText-103、PG-19、LongBench 中采样文本，写入本地 `data/temp_ffn/*.txt` 和 manifest |
+| `scripts/build_temp_ffn_experiment_plan.py` | 根据 `configs/temp_ffn_experiment_plan.json` 生成只包含命令的 shell 计划文件，不直接执行实验 |
+| `configs/temp_ffn_experiment_plan.json` | 实验矩阵配置，包括 memory table、随机 QKV、GPT-2 单 head、GPT-2 layer/head sweep、Pythia 单 head |
+
+### 13.2 Python 虚拟环境
+
+在计算资源准备好后，使用以下命令创建实验环境。
+
+CPU 版本适合 smoke test 和小规模随机实验：
+
+```bash
+TORCH_PROFILE=cpu bash scripts/setup_temp_ffn_env.sh
+source .venv/bin/activate
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+```
+
+如果服务器已有匹配 CUDA 的 PyTorch，不希望脚本重装 torch：
+
+```bash
+TORCH_PROFILE=existing bash scripts/setup_temp_ffn_env.sh
+source .venv/bin/activate
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+```
+
+如果需要由脚本安装 CUDA wheel，可选择：
+
+```bash
+TORCH_PROFILE=cuda121 bash scripts/setup_temp_ffn_env.sh
+```
+
+或：
+
+```bash
+TORCH_PROFILE=cuda124 bash scripts/setup_temp_ffn_env.sh
+```
+
+安装后先做轻量检查：
+
+```bash
+python -m compileall src tests examples scripts
+python - <<'PY'
+import torch
+import transformers
+import datasets
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("transformers:", transformers.__version__)
+print("datasets:", datasets.__version__)
+PY
+```
+
+### 13.3 数据集调研与选择
+
+本实验不需要一开始下载大型数据集。推荐按从小到大的顺序准备文本：
+
+| 阶段 | 数据源 | 选择理由 | 风险 |
+| --- | --- | --- | --- |
+| smoke test | synthetic | 不依赖网络和外部数据，验证脚本、tokenization、输出路径 | 不能代表真实文本结构 |
+| 第一批真实文本 | WikiText-103 validation | Wikipedia 长文档语言建模数据，体量适中，适合 GPT-2 初验 | 行级文本较多，需要拼接成较长上下文 |
+| 正式长文档 | PG-19 validation | 书籍级长文档，更接近长上下文压缩问题 | 数据体量大，完整下载约十 GB 级 |
+| 下游任务扩展 | LongBench 子集 | 面向 QA、摘要、检索等长上下文任务 | 适合在重构实验稳定后再做任务级替换验证 |
+
+优先准备 synthetic 和 WikiText-103：
+
+```bash
+python scripts/prepare_temp_ffn_dataset.py \
+  --source synthetic \
+  --output-name synthetic_smoke \
+  --force
+
+python scripts/prepare_temp_ffn_dataset.py \
+  --source wikitext103 \
+  --max-docs 64 \
+  --max-chars 2000000 \
+  --output-name wikitext103 \
+  --force
+```
+
+PG-19 建议只在磁盘和网络充足时准备 validation 子集：
+
+```bash
+python scripts/prepare_temp_ffn_dataset.py \
+  --source pg19 \
+  --split validation \
+  --max-docs 8 \
+  --max-chars 4000000 \
+  --output-name pg19_validation_sample \
+  --force
+```
+
+LongBench 建议在完成 attention 重构实验后再使用：
+
+```bash
+python scripts/prepare_temp_ffn_dataset.py \
+  --source longbench \
+  --subset qasper \
+  --split test \
+  --max-docs 32 \
+  --max-chars 2000000 \
+  --output-name longbench_qasper \
+  --force
+```
+
+每次准备数据后都会生成：
+
+```text
+data/temp_ffn/<name>.txt
+data/temp_ffn/<name>.manifest.json
+```
+
+其中 manifest 记录数据源、subset、split、文档数、字符数和来源说明，便于后续复现实验。
+
+### 13.4 实验命令计划生成
+
+默认实验矩阵位于：
+
+```bash
+configs/temp_ffn_experiment_plan.json
+```
+
+生成命令计划：
+
+```bash
+python scripts/build_temp_ffn_experiment_plan.py \
+  --config configs/temp_ffn_experiment_plan.json \
+  --output runs/temp_ffn/planned_commands.sh
+```
+
+该命令只写出 shell 命令，不执行实验。生成后先人工检查：
+
+```bash
+sed -n '1,220p' runs/temp_ffn/planned_commands.sh
+```
+
+如果需要把默认关闭的 layer/head sweep 和 Pythia 命令也写入计划：
+
+```bash
+python scripts/build_temp_ffn_experiment_plan.py \
+  --include-disabled \
+  --output runs/temp_ffn/planned_commands_all.sh
+```
+
+### 13.5 建议执行顺序
+
+在 GPU 或足够 CPU 资源可用后，建议按以下顺序执行。
+
+第一步，只运行 memory table。该步骤不需要 torch 训练，成本最低：
+
+```bash
+PYTHONPATH=src python examples/run_temp_ffn_compression.py \
+  memory \
+  --context-lengths 512,1024,2048,4096,8192,32768 \
+  --memory-units 32,64,128,256,512,1024 \
+  --layers 12 \
+  --heads 12 \
+  --head-dim 64 \
+  --output-dir runs/temp_ffn/memory_table_gpt2 \
+  --run-name memory_table_gpt2
+```
+
+第二步，运行小规模随机 QKV smoke test，验证训练链路：
+
+```bash
+PYTHONPATH=src python examples/run_temp_ffn_compression.py \
+  random \
+  --context-length 64 \
+  --head-dim 16 \
+  --query-count 32 \
+  --memory-units 4,8,16 \
+  --steps 20 \
+  --batch-size 16 \
+  --device cpu \
+  --output-dir runs/temp_ffn/random_smoke \
+  --run-name random_smoke
+```
+
+第三步，运行正式随机 QKV 实验：
+
+```bash
+PYTHONPATH=src python examples/run_temp_ffn_compression.py \
+  random \
+  --context-length 4096 \
+  --head-dim 64 \
+  --query-count 2048 \
+  --memory-units 32,64,128,256,512,1024 \
+  --steps 500 \
+  --batch-size 512 \
+  --device cuda \
+  --output-dir runs/temp_ffn/random_qkv_main \
+  --run-name random_qkv_main
+```
+
+第四步，使用 WikiText-103 文本运行 GPT-2 单层单 head 真实激活实验：
+
+```bash
+PYTHONPATH=src python examples/run_temp_ffn_compression.py \
+  hf-activations \
+  --model gpt2 \
+  --text-file data/temp_ffn/wikitext103.txt \
+  --layer 6 \
+  --head 0 \
+  --qkv-layout gpt2 \
+  --context-length 512 \
+  --query-count 128 \
+  --memory-units 32,64,128,256 \
+  --steps 500 \
+  --batch-size 128 \
+  --device cuda \
+  --output-dir runs/temp_ffn/gpt2_wikitext_single_head \
+  --run-name gpt2_wikitext_layer6_head0
+```
+
+第五步，在单 head 实验稳定后，再打开 `configs/temp_ffn_experiment_plan.json` 中的 `gpt2_layer_head_grid`，执行 layer/head sweep。Pythia-160M 可作为第二模型验证，必须设置：
+
+```text
+qkv_layout = gpt-neox
+qkv_module_pattern = gpt_neox.layers.{layer}.attention.query_key_value
+```
+
+### 13.6 每次实验需要记录的元数据
+
+每次正式运行前记录：
+
+| 项目 | 命令 |
+| --- | --- |
+| commit | `git rev-parse --short HEAD` |
+| 分支 | `git branch --show-current` |
+| Python | `python --version` |
+| PyTorch / CUDA | `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"` |
+| GPU | `nvidia-smi` |
+| 数据 manifest | `cat data/temp_ffn/<name>.manifest.json` |
+| 实验配置 | `cat configs/temp_ffn_experiment_plan.json` |
+
+输出目录统一保存在：
+
+```text
+runs/temp_ffn/
+```
+
+该目录已被 `.gitignore` 忽略，不应提交实验产物。
+
+### 13.7 判读指标优先级
+
+实验完成后优先查看：
+
+1. `metrics.relative_error`：衡量整体重构误差；
+2. `metrics.cosine_similarity`：衡量输出方向是否保留；
+3. `metrics.mse`：用于同一设置内比较；
+4. `memory_cost.compression_ratio`：理论压缩倍数；
+5. layer/head sweep 中不同 head 的指标排序：判断是否只有部分 head 适合压缩。
+
+初步判断标准：
+
+- 如果真实激活在相同 $M$ 下明显优于随机 QKV，说明模型内部 attention 存在可压缩结构；
+- 如果少数 layer/head 误差显著高，说明它们可能承担更精确的检索或复制功能；
+- 如果较小 $M$ 能保持较高 cosine similarity 但 relative error 不低，说明 temporary FFN 可能更适合作为语义记忆，而不是精确 token-level KV cache 替代。
