@@ -54,6 +54,7 @@ class MemoryCost:
 class TemporaryFFNFitResult:
     memory_units: int
     metrics: dict[str, float]
+    eval_metrics: dict[str, float] | None = None
     history: list[dict[str, float]] = field(default_factory=list)
     memory_cost: MemoryCost | None = None
     model_state: dict[str, Any] | None = None
@@ -62,6 +63,7 @@ class TemporaryFFNFitResult:
         payload: dict[str, Any] = {
             "memory_units": self.memory_units,
             "metrics": self.metrics,
+            "eval_metrics": self.eval_metrics,
             "history": self.history,
             "memory_cost": self.memory_cost.to_dict() if self.memory_cost else None,
         }
@@ -191,6 +193,7 @@ def run_compression_sweep(
     k,
     v,
     memory_units: Sequence[int],
+    eval_q=None,
     steps: int = 500,
     lr: float = 1e-2,
     batch_size: int | None = None,
@@ -203,6 +206,7 @@ def run_compression_sweep(
     torch = require_torch()
     with torch.no_grad():
         target = scaled_dot_product_attention(q, k, v)
+        eval_target = scaled_dot_product_attention(eval_q, k, v) if eval_q is not None else None
 
     results: list[TemporaryFFNFitResult] = []
     for index, units in enumerate(memory_units):
@@ -216,10 +220,16 @@ def run_compression_sweep(
             init=init,
         )
         model, metrics, history = fit_temporary_ffn(q, target, config, k_init=k, v_init=v)
+        eval_metrics = None
+        if eval_q is not None and eval_target is not None:
+            with torch.no_grad():
+                eval_prediction = model(eval_q)
+                eval_metrics = reconstruction_metrics(eval_target, eval_prediction)
         results.append(
             TemporaryFFNFitResult(
                 memory_units=units,
                 metrics=metrics,
+                eval_metrics=eval_metrics,
                 history=history,
                 memory_cost=MemoryCost(
                     context_length=k.shape[0],

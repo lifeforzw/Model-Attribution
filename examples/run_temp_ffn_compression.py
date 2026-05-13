@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     random_parser.add_argument("--context-length", type=int, default=4096)
     random_parser.add_argument("--head-dim", type=int, default=64)
     random_parser.add_argument("--query-count", type=int, default=2048)
+    random_parser.add_argument(
+        "--eval-query-count",
+        type=int,
+        default=0,
+        help="Optional held-out query count for evaluating the same context-specific temporary FFN.",
+    )
     random_parser.add_argument("--device", default="auto")
     random_parser.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     random_parser.add_argument("--seed", type=int, default=13)
@@ -56,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     hf_parser.add_argument("--repeat-text", action=argparse.BooleanOptionalAction, default=True)
     hf_parser.add_argument("--context-length", type=int, default=512)
     hf_parser.add_argument("--query-count", type=int, default=128)
+    hf_parser.add_argument(
+        "--eval-query-count",
+        type=int,
+        default=0,
+        help="Optional held-out future-token query count for evaluating the fitted context-specific temporary FFN.",
+    )
     hf_parser.add_argument("--layer", type=int, default=6)
     hf_parser.add_argument("--head", type=int, default=0)
     hf_parser.add_argument(
@@ -100,16 +112,21 @@ def run_random(args: argparse.Namespace) -> int:
     q, k, v = generate_random_qkv(
         context_length=args.context_length,
         head_dim=args.head_dim,
-        query_count=args.query_count,
+        query_count=args.query_count + args.eval_query_count,
         seed=args.seed,
         device=str(device),
         dtype=args.dtype,
     )
+    eval_q = None
+    if args.eval_query_count:
+        eval_q = q[args.query_count : args.query_count + args.eval_query_count]
+        q = q[: args.query_count]
     results = run_compression_sweep(
         q=q,
         k=k,
         v=v,
         memory_units=parse_int_list(args.memory_units),
+        eval_q=eval_q,
         steps=args.steps,
         lr=args.lr,
         batch_size=args.batch_size,
@@ -119,6 +136,7 @@ def run_random(args: argparse.Namespace) -> int:
     )
     payload = {
         "experiment": "random_qkv",
+        "compression_scope": "synthetic_random_baseline",
         "settings": sanitize_settings(vars(args)),
         "results": summarize_results(results),
     }
@@ -153,17 +171,25 @@ def run_hf_activations(args: argparse.Namespace) -> int:
     token_ids = ensure_token_count(
         tokenizer,
         text,
-        required=args.context_length + args.query_count,
+        required=args.context_length + args.query_count + args.eval_query_count,
         repeat_text=args.repeat_text,
     )
-    batch = {"input_ids": token_ids[: args.context_length + args.query_count].unsqueeze(0).to(device)}
+    total_tokens = args.context_length + args.query_count + args.eval_query_count
+    batch = {"input_ids": token_ids[:total_tokens].unsqueeze(0).to(device)}
     if hasattr(tokenizer, "pad_token_id"):
         batch["attention_mask"] = torch.ones_like(batch["input_ids"])
 
     pattern = args.qkv_module_pattern or rf"transformer\.h\.{args.layer}\.attn\.c_attn"
     packed, module_name = capture_single_module_output(model, batch, pattern)
     q, k, v = split_packed_qkv(packed, num_heads=get_num_heads(model), head=args.head, layout=args.qkv_layout)
-    q = q[args.context_length : args.context_length + args.query_count].float()
+    q_all = q
+    q = q_all[args.context_length : args.context_length + args.query_count].float()
+    eval_q = None
+    if args.eval_query_count:
+        eval_q = q_all[
+            args.context_length + args.query_count :
+            args.context_length + args.query_count + args.eval_query_count
+        ].float()
     k = k[: args.context_length].float()
     v = v[: args.context_length].float()
 
@@ -172,6 +198,7 @@ def run_hf_activations(args: argparse.Namespace) -> int:
         k=k,
         v=v,
         memory_units=parse_int_list(args.memory_units),
+        eval_q=eval_q,
         steps=args.steps,
         lr=args.lr,
         batch_size=args.batch_size,
@@ -184,8 +211,12 @@ def run_hf_activations(args: argparse.Namespace) -> int:
     run_name = args.run_name or f"{args.model.rstrip('/').split('/')[-1]}_layer{args.layer}_head{args.head}"
     payload = {
         "experiment": "hf_activations",
+        "compression_scope": "context_specific_temporary_memory",
         "settings": sanitize_settings(vars(args)),
         "captured_module": module_name,
+        "context_tokens": args.context_length,
+        "train_query_tokens": args.query_count,
+        "eval_query_tokens": args.eval_query_count,
         "num_heads": get_num_heads(model),
         "num_layers": get_num_layers(model),
         "results": summarize_results(results),
@@ -307,16 +338,31 @@ def ensure_token_count(tokenizer, text: str, *, required: int, repeat_text: bool
 
 
 def print_result_table(results) -> None:
-    print("M\tMSE\t\tRelErr\t\tCosSim\t\tRatio")
+    has_eval = any(result.eval_metrics for result in results)
+    if has_eval:
+        print("M\tMSE\t\tRelErr\t\tCosSim\t\tEvalRelErr\tEvalCosSim\tRatio")
+    else:
+        print("M\tMSE\t\tRelErr\t\tCosSim\t\tRatio")
     for result in results:
         cost = result.memory_cost
-        print(
-            f"{result.memory_units}\t"
-            f"{result.metrics['mse']:.6g}\t"
-            f"{result.metrics['relative_error']:.6g}\t"
-            f"{result.metrics['cosine_similarity']:.6g}\t"
-            f"{cost.compression_ratio if cost else 0:.2f}"
-        )
+        if result.eval_metrics:
+            print(
+                f"{result.memory_units}\t"
+                f"{result.metrics['mse']:.6g}\t"
+                f"{result.metrics['relative_error']:.6g}\t"
+                f"{result.metrics['cosine_similarity']:.6g}\t"
+                f"{result.eval_metrics['relative_error']:.6g}\t"
+                f"{result.eval_metrics['cosine_similarity']:.6g}\t"
+                f"{cost.compression_ratio if cost else 0:.2f}"
+            )
+        else:
+            print(
+                f"{result.memory_units}\t"
+                f"{result.metrics['mse']:.6g}\t"
+                f"{result.metrics['relative_error']:.6g}\t"
+                f"{result.metrics['cosine_similarity']:.6g}\t"
+                f"{cost.compression_ratio if cost else 0:.2f}"
+            )
 
 
 def get_num_heads(model) -> int:

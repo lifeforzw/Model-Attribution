@@ -1,6 +1,8 @@
 # Context-to-Temporary-FFN 云服务器实验步骤
 
-本文档用于在云服务器上从零开始复现 `Context-to-Temporary-FFN` 实验。目标是让实验者在 clone 仓库后，可以直接按照步骤完成环境配置、随机 QKV 模拟实验、真实 Transformer 激活拟合实验、layer/head sweep 和显存参数量分析。
+本文档用于在云服务器上从零开始复现 `Context-to-Temporary-FFN` 实验。目标是让实验者在 clone 仓库后，可以直接按照步骤完成环境配置、随机 QKV baseline、真实 Transformer 上下文特定 temporary FFN 拟合实验、layer/head sweep 和显存参数量分析。
+
+本实验的核心不是训练一个跨输入泛化的永久 FFN，而是针对一次具体生成场景，将当前长上下文的 token-level KV cache 临时压缩成更小的 parameter-level temporary FFN memory。换句话说，temporary FFN 参数是 context-specific 的：输入上下文改变后，临时参数也应重新生成、更新或失效。
 
 ## 1. 实验分支
 
@@ -118,6 +120,7 @@ PYTHONPATH=src python examples/run_temp_ffn_compression.py \
   --context-length 64 \
   --head-dim 16 \
   --query-count 32 \
+  --eval-query-count 16 \
   --memory-units 4,8,16 \
   --steps 20 \
   --batch-size 16 \
@@ -164,6 +167,7 @@ PYTHONPATH=src bash scripts/run_temp_ffn_random.sh
 | `CONTEXT_LENGTH` | `4096` |
 | `HEAD_DIM` | `64` |
 | `QUERY_COUNT` | `2048` |
+| `EVAL_QUERY_COUNT` | `0` |
 | `MEMORY_UNITS` | `32,64,128,256,512,1024` |
 | `STEPS` | `500` |
 | `BATCH_SIZE` | `512` |
@@ -176,6 +180,7 @@ PYTHONPATH=src bash scripts/run_temp_ffn_random.sh
 ```bash
 CONTEXT_LENGTH=1024 \
 QUERY_COUNT=512 \
+EVAL_QUERY_COUNT=128 \
 MEMORY_UNITS=32,64,128,256 \
 STEPS=300 \
 BATCH_SIZE=256 \
@@ -188,6 +193,7 @@ PYTHONPATH=src bash scripts/run_temp_ffn_random.sh
 CONTEXT_LENGTH=4096 \
 HEAD_DIM=64 \
 QUERY_COUNT=2048 \
+EVAL_QUERY_COUNT=512 \
 MEMORY_UNITS=32,64,128,256,512,1024 \
 STEPS=1000 \
 BATCH_SIZE=512 \
@@ -203,6 +209,7 @@ PYTHONPATH=src python examples/run_temp_ffn_compression.py \
   --context-length 4096 \
   --head-dim 64 \
   --query-count 2048 \
+  --eval-query-count 512 \
   --memory-units 32,64,128,256,512,1024 \
   --steps 500 \
   --batch-size 512 \
@@ -248,7 +255,7 @@ runs/temp_ffn/random_sweep/
 
 ## 8. 实验二：真实 Transformer 激活拟合
 
-该实验从真实 HuggingFace causal LM 内部抽取某一层、某个 head 的 $Q,K,V$，然后训练临时 softmax-FFN 拟合完整 attention 输出。
+该实验从真实 HuggingFace causal LM 内部抽取某一层、某个 head 的 $Q,K,V$，然后训练 context-specific temporary softmax-FFN 拟合完整 attention 输出。推荐设置 `EVAL_QUERY_COUNT`，让脚本用同一 context 后面的 held-out future queries 评估临时参数是否能近似固定 context 下的 attention function。
 
 ### 8.1 GPT-2 small
 
@@ -266,6 +273,7 @@ LAYER=6 \
 HEAD=0 \
 CONTEXT_LENGTH=512 \
 QUERY_COUNT=128 \
+EVAL_QUERY_COUNT=128 \
 MEMORY_UNITS=32,64,128,256 \
 STEPS=500 \
 DEVICE=cuda \
@@ -280,6 +288,7 @@ LAYER=6 \
 HEAD=0 \
 CONTEXT_LENGTH=128 \
 QUERY_COUNT=32 \
+EVAL_QUERY_COUNT=32 \
 MEMORY_UNITS=8,16,32 \
 STEPS=50 \
 DEVICE=cpu \
@@ -304,6 +313,7 @@ LAYER=6 \
 HEAD=0 \
 CONTEXT_LENGTH=512 \
 QUERY_COUNT=128 \
+EVAL_QUERY_COUNT=128 \
 MEMORY_UNITS=32,64,128,256 \
 STEPS=500 \
 DEVICE=cuda \
@@ -337,7 +347,7 @@ PYTHONPATH=src bash scripts/run_temp_ffn_hf_activations.sh
 脚本默认会在文本 token 数不足时重复文本，直到满足：
 
 ```text
-context_length + query_count
+context_length + query_count + eval_query_count
 ```
 
 如需禁止重复，可以直接调用 Python CLI 并加：
@@ -358,6 +368,7 @@ LAYERS="0 3 6 9 11" \
 HEADS="0 1 2 3" \
 CONTEXT_LENGTH=512 \
 QUERY_COUNT=128 \
+EVAL_QUERY_COUNT=128 \
 MEMORY_UNITS=32,64,128,256 \
 STEPS=350 \
 DEVICE=cuda \
@@ -380,6 +391,7 @@ for LAYER in 0 3 6 9 11; do
       --head "$HEAD" \
       --context-length 512 \
       --query-count 128 \
+      --eval-query-count 128 \
       --memory-units 32,64,128,256 \
       --steps 350 \
       --batch-size 128 \
@@ -397,7 +409,7 @@ runs/temp_ffn/hf_layer_head_sweep/
 runs/temp_ffn/pythia_layer_head_sweep/
 ```
 
-后续可以根据每个 summary 中的 `relative_error` 和 `cosine_similarity` 对 layer/head 排序。
+后续可以根据每个 summary 中的 `metrics.relative_error`、`metrics.cosine_similarity`、`eval_metrics.relative_error` 和 `eval_metrics.cosine_similarity` 对 layer/head 排序。优先关注 held-out future query 指标，因为它更接近生成场景下对后续 token 的近似能力。
 
 ## 10. 显存与参数量分析
 
@@ -460,6 +472,11 @@ $$
         "relative_error": 0.0,
         "cosine_similarity": 1.0
       },
+      "eval_metrics": {
+        "mse": 0.0,
+        "relative_error": 0.0,
+        "cosine_similarity": 1.0
+      },
       "history": [],
       "memory_cost": {
         "context_length": 4096,
@@ -481,6 +498,8 @@ $$
 | `metrics.mse` | 输出重构误差 |
 | `metrics.relative_error` | 相对重构误差 |
 | `metrics.cosine_similarity` | 输出方向相似度 |
+| `eval_metrics.relative_error` | held-out future query 上的相对重构误差；未设置 `eval_query_count` 时为 `null` |
+| `eval_metrics.cosine_similarity` | held-out future query 上的输出方向相似度 |
 | `memory_cost.compression_ratio` | 理论压缩比 $N/M$ |
 | `history` | 训练过程中的 loss 记录 |
 
@@ -588,6 +607,7 @@ PY
 ```bash
 CONTEXT_LENGTH=256
 QUERY_COUNT=64
+EVAL_QUERY_COUNT=32
 MEMORY_UNITS=16,32,64
 STEPS=200
 BATCH_SIZE=64
@@ -628,6 +648,7 @@ python examples/run_temp_ffn_compression.py \
   --context-length 64 \
   --head-dim 16 \
   --query-count 32 \
+  --eval-query-count 16 \
   --memory-units 4,8,16 \
   --steps 20 \
   --batch-size 16 \
@@ -645,6 +666,7 @@ LAYER=6 \
 HEAD=0 \
 CONTEXT_LENGTH=512 \
 QUERY_COUNT=128 \
+EVAL_QUERY_COUNT=128 \
 MEMORY_UNITS=32,64,128,256 \
 STEPS=500 \
 DEVICE=cuda \
@@ -662,16 +684,19 @@ PYTHONPATH=src bash scripts/run_temp_ffn_hf_activations.sh
 | Layer / Head | 单点实验或 sweep 范围 |
 | $N$ | context length |
 | $T$ | query count |
+| $T_{eval}$ | held-out future query count |
 | $M$ | memory units 列表 |
 | steps / batch size | 训练设置 |
-| MSE / RelErr / CosSim | 核心重构指标 |
+| MSE / RelErr / CosSim | 训练 query 核心重构指标 |
+| Eval RelErr / Eval CosSim | held-out future query 重构指标 |
 | compression ratio | 理论压缩比 |
 | GPU 型号 | 便于对比速度和显存 |
 
 建议将最终表格与 `docs/context_to_temporary_ffn_experiment.zh.md` 中的问题一一对应，重点判断：
 
 - 随机 QKV 是否存在稳定压缩趋势；
-- 真实模型激活是否比随机 QKV 更容易压缩；
+- 真实模型上下文激活是否比随机 QKV baseline 更容易压缩；
+- held-out future query 指标是否接近训练 query 指标；
 - 哪些 layer/head 更容易压缩；
 - 较小 $M$ 是否能在较高压缩比下保持较好的 cosine similarity；
 - 该方法更适合作为语义压缩记忆，还是能够支持更精确的 token-level 记忆替代。

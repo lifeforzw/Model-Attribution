@@ -6,6 +6,7 @@ from llm_hookkit import (
     build_exact_attention_ffn,
     fit_temporary_ffn,
     reconstruction_metrics,
+    run_compression_sweep,
     scaled_dot_product_attention,
 )
 
@@ -55,3 +56,28 @@ def test_fit_temporary_ffn_reconstructs_easy_exact_case():
 
     assert exact_metrics["mse"] < 1e-12
     assert metrics["mse"] < 1.0
+
+
+def test_compression_sweep_reports_held_out_eval_metrics():
+    torch.manual_seed(2)
+    q = torch.randn(8, 3)
+    eval_q = torch.randn(4, 3)
+    k = torch.randn(4, 3)
+    v = torch.randn(4, 3)
+
+    results = run_compression_sweep(
+        q=q,
+        k=k,
+        v=v,
+        eval_q=eval_q,
+        memory_units=(4,),
+        steps=1,
+        lr=1e-3,
+        batch_size=4,
+        cosine_weight=0.0,
+        init="sample",
+        seed=2,
+    )
+
+    assert results[0].eval_metrics is not None
+    assert "relative_error" in results[0].eval_metrics

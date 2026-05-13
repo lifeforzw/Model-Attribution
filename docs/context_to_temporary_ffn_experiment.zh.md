@@ -46,6 +46,16 @@ $$
 
 > 对于固定长上下文 $C$，完整 attention 可以被等价地看作一个由上下文动态生成的 softmax-FFN；进一步地，可以尝试用更少隐藏单元的临时 FFN 参数块近似该 attention 函数，从而减少对完整 KV cache 的依赖。
 
+需要强调的是，本实验目标不是训练一个跨 prompt、跨文档、跨任务复用的通用 FFN。这里的 temporary FFN 是一次具体生成场景下的 **context-specific temporary memory**：
+
+- 给定当前输入上下文 $C$；
+- 针对某一层、某一个 attention head 的 $K_C,V_C$；
+- 离线或在线快速拟合一组临时参数 $W_{1,C},W_{2,C}$；
+- 在同一个上下文后续生成 token 的 query 上近似原 attention 输出；
+- 用更小的参数块替代或辅助原始 token-level KV cache，从而降低显存压力。
+
+因此，temporary FFN 的参数随 context 改变而改变。上下文换了，$K_C,V_C$ 也会换，相应的 temporary FFN 也应重新生成、更新或失效。
+
 原始 attention 可以写作：
 
 $$
@@ -110,6 +120,14 @@ $$
 
 即用 $M$ 个临时 memory units 近似原本 $N$ 个 token-level KV units 的 attention 行为。
 
+为了更贴近生成场景，真实模型实验应区分：
+
+- `context_length`：被压缩的历史上下文 token 数；
+- `query_count`：用于拟合 temporary FFN 的当前/后续 query token 数；
+- `eval_query_count`：不参与训练、只用于评估的 held-out future query token 数。
+
+如果 temporary FFN 只在训练 query 上表现好，但在 held-out future query 上明显退化，说明它只是记住了训练 query，而不是稳定近似固定 context 下的 attention function。
+
 ## 4. 实验总体问题
 
 本实验主要回答以下问题：
@@ -129,6 +147,12 @@ $$
 > 在随机生成的 $Q,K,V$ 条件下，是否可以训练一个小规模临时 softmax-FFN 来拟合完整 attention 输出。
 
 该实验不依赖任何真实大模型，仅从数学层面验证压缩近似是否成立。
+
+在本项目的新目标下，随机 $Q,K,V$ 只作为 **无结构 baseline**。它不用于证明泛化性，也不代表最终应用场景。它的作用是回答：
+
+> 如果 $Q,K,V$ 没有真实模型激活中的结构性，压缩会有多难？
+
+如果随机 QKV 难压缩，而真实模型上下文 QKV 明显更容易压缩，则说明真实生成场景中可能存在可利用的上下文冗余或低维结构。
 
 ### 5.2 实验输入
 
@@ -719,8 +743,8 @@ examples/run_temp_ffn_compression.py
 
 | 子命令 | 用途 |
 | --- | --- |
-| `random` | 构造随机 $Q,K,V$ 并训练 temporary FFN 拟合完整 attention 输出 |
-| `hf-activations` | 从 HuggingFace causal LM 的 packed QKV projection 中捕获真实 $Q,K,V$，再进行 temporary FFN 拟合 |
+| `random` | 构造随机 $Q,K,V$ 作为无结构 baseline，并训练 temporary FFN 拟合完整 attention 输出 |
+| `hf-activations` | 从 HuggingFace causal LM 的 packed QKV projection 中捕获真实 $Q,K,V$，训练 context-specific temporary FFN，并可在 held-out future queries 上评估 |
 | `memory` | 生成 KV cache 与 temporary FFN 参数量对比表 |
 
 新增的准备脚本：
@@ -896,6 +920,7 @@ PYTHONPATH=src python examples/run_temp_ffn_compression.py \
   --context-length 64 \
   --head-dim 16 \
   --query-count 32 \
+  --eval-query-count 16 \
   --memory-units 4,8,16 \
   --steps 20 \
   --batch-size 16 \
@@ -912,6 +937,7 @@ PYTHONPATH=src python examples/run_temp_ffn_compression.py \
   --context-length 4096 \
   --head-dim 64 \
   --query-count 2048 \
+  --eval-query-count 512 \
   --memory-units 32,64,128,256,512,1024 \
   --steps 500 \
   --batch-size 512 \
@@ -932,6 +958,7 @@ PYTHONPATH=src python examples/run_temp_ffn_compression.py \
   --qkv-layout gpt2 \
   --context-length 512 \
   --query-count 128 \
+  --eval-query-count 128 \
   --memory-units 32,64,128,256 \
   --steps 500 \
   --batch-size 128 \
@@ -974,13 +1001,15 @@ runs/temp_ffn/
 实验完成后优先查看：
 
 1. `metrics.relative_error`：衡量整体重构误差；
-2. `metrics.cosine_similarity`：衡量输出方向是否保留；
-3. `metrics.mse`：用于同一设置内比较；
-4. `memory_cost.compression_ratio`：理论压缩倍数；
-5. layer/head sweep 中不同 head 的指标排序：判断是否只有部分 head 适合压缩。
+2. `eval_metrics.relative_error`：衡量同一 context 下 held-out future query 的重构误差；
+3. `metrics.cosine_similarity` 和 `eval_metrics.cosine_similarity`：衡量输出方向是否保留；
+4. `metrics.mse`：用于同一设置内比较；
+5. `memory_cost.compression_ratio`：理论压缩倍数；
+6. layer/head sweep 中不同 head 的指标排序：判断是否只有部分 head 适合压缩。
 
 初步判断标准：
 
 - 如果真实激活在相同 $M$ 下明显优于随机 QKV，说明模型内部 attention 存在可压缩结构；
+- 如果 held-out future query 的 `eval_metrics` 与训练 query 指标接近，说明 temporary FFN 更像是在近似固定 context 的 attention function，而不是仅记住训练 query；
 - 如果少数 layer/head 误差显著高，说明它们可能承担更精确的检索或复制功能；
 - 如果较小 $M$ 能保持较高 cosine similarity 但 relative error 不低，说明 temporary FFN 可能更适合作为语义记忆，而不是精确 token-level KV cache 替代。
